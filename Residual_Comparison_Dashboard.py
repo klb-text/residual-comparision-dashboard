@@ -1,6 +1,7 @@
 
 # Residual Comparison Dashboard (Streamlit)
-# Upload two Excel files (last month & this month) and get a summary + Excel diff output
+# Upload two Excel files (last month & this month), filter to "Changed" by default,
+# show "What Changed", download workbooks, and push files to Dropbox.
 # Author: M365 Copilot for Kevin Blamer
 
 import io
@@ -8,6 +9,10 @@ import pandas as pd
 import numpy as np
 import streamlit as st
 from datetime import datetime
+
+# Dropbox SDK
+import dropbox
+from dropbox.files import WriteMode, UploadSessionCursor, CommitInfo
 
 st.set_page_config(page_title="Residual Comparison Dashboard", layout="wide")
 
@@ -21,8 +26,7 @@ st.caption(
 REQ_COLUMNS = [
     "Residual Master Title", "Normal Miles", "Optional Miles", "Terms"
 ]
-# Optional (used for filtering, if present in either file)
-OPTIONAL_COLUMNS = ["Finance Company"]
+OPTIONAL_COLUMNS = ["Finance Company"]  # used if present
 
 @st.cache_data
 def parse_list(val):
@@ -59,19 +63,17 @@ def parse_list(val):
 def load_sheet(_file_bytes: bytes):
     """
     Load the first sheet from an uploaded Excel file.
-    NOTE: Leading underscore in '_file_bytes' tells Streamlit not to hash this arg for caching.
+    Leading underscore in '_file_bytes' excludes it from cache hashing.
     Pass raw bytes from UploadedFile.read().
     """
     df = pd.read_excel(io.BytesIO(_file_bytes), sheet_name=0, engine='openpyxl')
     df.columns = [str(c).strip() for c in df.columns]
-    # Minimal check (required columns)
     missing = [c for c in REQ_COLUMNS if c not in df.columns]
     if missing:
         raise ValueError(f"Missing required columns: {missing}")
     return df
 
 def safe_get(series, key, default=""):
-    """Get series[key] if present; otherwise default."""
     try:
         return series.get(key, default)
     except Exception:
@@ -89,7 +91,6 @@ def compare_frames(last_df: pd.DataFrame, this_df: pd.DataFrame):
             'Normal Miles': row['Normal Miles'],
             'Optional Miles': parse_list(row['Optional Miles']),
             'Terms': parse_list(row['Terms']),
-            # Include optional fields (e.g., Finance Company)
             'Finance Company': safe_get(row, 'Finance Company')
         }
 
@@ -107,17 +108,15 @@ def compare_frames(last_df: pd.DataFrame, this_df: pd.DataFrame):
 
     def build_change_summary(prev, curr, status, normal_prev, normal_curr,
                              terms_prev, terms_curr, opt_prev, opt_curr):
-        """Return a concise human-readable description of what changed."""
+        """Concise description of deltas."""
         notes = []
         if status.startswith("Removed"):
             notes.append("Removed program")
-            # Optionally list prior terms/miles removed
             if terms_prev:
                 notes.append(f"Terms removed: {', '.join(map(str, terms_prev))}")
             if opt_prev:
                 notes.append(f"Optional Miles removed: {', '.join(map(str, opt_prev))}")
             return "; ".join(notes)
-
         if status.startswith("New"):
             notes.append("New program")
             if terms_curr:
@@ -125,25 +124,21 @@ def compare_frames(last_df: pd.DataFrame, this_df: pd.DataFrame):
             if opt_curr:
                 notes.append(f"Optional Miles: {', '.join(map(str, opt_curr))}")
             return "; ".join(notes)
-
-        # Changed: enumerate specifics
+        # Changed specifics
         if normal_prev != normal_curr:
             notes.append(f"Normal Miles: {normal_prev} → {normal_curr}")
-
         terms_added = [t for t in terms_curr if t not in terms_prev]
         terms_removed = [t for t in terms_prev if t not in terms_curr]
         if terms_added:
             notes.append(f"Terms added: {', '.join(map(str, terms_added))}")
         if terms_removed:
             notes.append(f"Terms removed: {', '.join(map(str, terms_removed))}")
-
         opt_added = [m for m in opt_curr if m not in opt_prev]
         opt_removed = [m for m in opt_prev if m not in opt_curr]
         if opt_added:
             notes.append(f"Optional Miles added: {', '.join(map(str, opt_added))}")
         if opt_removed:
             notes.append(f"Optional Miles removed: {', '.join(map(str, opt_removed))}")
-
         return "; ".join(notes) if notes else "—"
 
     records = []
@@ -151,7 +146,6 @@ def compare_frames(last_df: pd.DataFrame, this_df: pd.DataFrame):
         prev = last_keyed.get(title)
         curr = this_keyed.get(title)
 
-        # Compose comparison values
         normal_prev = prev['Normal Miles'] if prev else np.nan
         normal_curr = curr['Normal Miles'] if curr else np.nan
         opt_prev = prev['Optional Miles'] if prev else tuple()
@@ -179,7 +173,7 @@ def compare_frames(last_df: pd.DataFrame, this_df: pd.DataFrame):
             'Residual Master Title': title,
             'Finance Company': finance_company,
             'Status': status,
-            'What Changed': what_changed,  # <-- NEW COLUMN directly after Status
+            'What Changed': what_changed,  # NEW COLUMN after Status
             'Normal Miles (prev)': normal_prev,
             'Normal Miles (curr)': normal_curr,
             'Normal Miles Changed': (normal_prev != normal_curr),
@@ -204,23 +198,44 @@ def compare_frames(last_df: pd.DataFrame, this_df: pd.DataFrame):
     }
     summary_df = pd.DataFrame(list(summary.items()), columns=['Metric','Value'])
 
-    # Filtered changes view
     changes_df = result_df[result_df['Status'] == 'Changed'].copy()
 
-    # Order columns (place 'What Changed' right after Status)
     ordered_cols = [
         'Residual Master Title', 'Finance Company', 'Status', 'What Changed',
         'Normal Miles (prev)', 'Normal Miles (curr)', 'Normal Miles Changed',
         'Terms (prev)', 'Terms (curr)', 'Terms Added', 'Terms Removed',
         'Optional Miles (prev)', 'Optional Miles (curr)', 'Optional Miles Added', 'Optional Miles Removed'
     ]
-    # Keep columns that exist (Finance Company may be missing if not present in inputs)
     ordered_cols = [c for c in ordered_cols if c in result_df.columns]
-
     result_df = result_df[ordered_cols]
     changes_df = changes_df[[c for c in ordered_cols if c in changes_df.columns]]
 
     return summary_df, result_df, changes_df
+
+# --- Dropbox helpers ---
+def upload_bytes_to_dropbox(dbx: dropbox.Dropbox, data: bytes, dest_path: str, overwrite: bool = True):
+    """
+    Upload bytes to Dropbox at dest_path.
+    Uses chunked upload for large payloads and WriteMode.overwrite by default.
+    """
+    mode = WriteMode.overwrite if overwrite else WriteMode.add
+    CHUNK = 4 * 1024 * 1024  # 4MB
+    size = len(data)
+    if size <= CHUNK:
+        dbx.files_upload(data, dest_path, mode=mode)
+        return
+    # Chunked upload
+    start = dbx.files_upload_session_start(data[:CHUNK])
+    cursor = UploadSessionCursor(session_id=start.session_id, offset=CHUNK)
+    while cursor.offset < size:
+        next_offset = min(size, cursor.offset + CHUNK)
+        chunk = data[cursor.offset:next_offset]
+        if next_offset >= size:
+            commit = CommitInfo(path=dest_path, mode=mode)
+            dbx.files_upload_session_finish(chunk, cursor, commit)
+        else:
+            dbx.files_upload_session_append_v2(chunk, cursor)
+            cursor.offset = next_offset
 
 # --- UI ---
 col_l, col_r = st.columns(2)
@@ -236,9 +251,11 @@ if run_btn:
         st.error("Please upload both files before running the comparison.")
         st.stop()
     try:
-        # Use .read() to get bytes; pass to loader with underscore arg (excluded from caching)
-        last_df = load_sheet(last_upl.read())
-        this_df = load_sheet(this_upl.read())
+        # Read once so we retain raw bytes for Dropbox and parsing
+        last_bytes = last_upl.read()
+        this_bytes = this_upl.read()
+        last_df = load_sheet(last_bytes)
+        this_df = load_sheet(this_bytes)
     except Exception as e:
         st.error(f"Failed to read files: {e}")
         st.stop()
@@ -262,11 +279,8 @@ if run_btn:
         status_options = sorted(result_df['Status'].unique().tolist())
         default_status = 'Changed' if 'Changed' in status_options else status_options[0]
         status_sel = st.selectbox("Status", options=status_options, index=status_options.index(default_status))
-
-        # Finance Company filter (if present)
         finance_companies = result_df['Finance Company'].dropna().unique().tolist() if 'Finance Company' in result_df.columns else []
         fin_sel = st.multiselect("Finance Company", options=sorted(finance_companies)) if finance_companies else []
-
         title_query = st.text_input("Title contains", value="")
 
     # Apply filters
@@ -285,41 +299,72 @@ if run_btn:
     st.subheader("Only Changes (raw)")
     st.dataframe(changes_df, use_container_width=True)
 
-    # --- Downloads ---
+    # --- Build workbooks ---
     out_name_full = f"Residual_Changes_{datetime.today().strftime('%Y-%m-%d')}.xlsx"
     out_name_filtered = f"Residual_Changes_Filtered_{datetime.today().strftime('%Y-%m-%d')}.xlsx"
 
     def build_workbook_bytes(df_all, df_changes, summary):
         bio = io.BytesIO()
         with pd.ExcelWriter(bio, engine='openpyxl') as writer:
-            # Summary
             summary.to_excel(writer, sheet_name='Summary', index=False)
-            # All Programs
             df_all.to_excel(writer, sheet_name='All_Programs', index=False)
-            # Only Changes
             df_changes.to_excel(writer, sheet_name='Only_Changes', index=False)
         bio.seek(0)
         return bio
 
-    # Full workbook (unfiltered)
     full_bio = build_workbook_bytes(result_df, changes_df, summary_df)
+    filtered_changes = filtered_df[filtered_df['Status'] == 'Changed'] if 'Status' in filtered_df.columns else pd.DataFrame()
+    filtered_summary = summary_df.copy()
+    filtered_bio = build_workbook_bytes(filtered_df, filtered_changes, filtered_summary)
+
+    # --- Downloads ---
     st.download_button(
         label=f"Download Excel (Full) — {out_name_full}",
         data=full_bio,
         file_name=out_name_full,
         mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
     )
-
-    # Filtered workbook (based on current filters)
-    # Recompute changes_df for the filtered subset (if Status != Changed, this tab may be empty)
-    filtered_changes = filtered_df[filtered_df['Status'] == 'Changed'] if 'Status' in filtered_df.columns else pd.DataFrame()
-    filtered_summary = summary_df.copy()  # Keep original summary; or compute filtered metrics if desired
-    filtered_bio = build_workbook_bytes(filtered_df, filtered_changes, filtered_summary)
     st.download_button(
         label=f"Download Excel (Filtered) — {out_name_filtered}",
         data=filtered_bio,
         file_name=out_name_filtered,
         mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
     )
+
+    # --- Dropbox drop-off (optional) ---
+    with st.expander("Dropbox (optional)", expanded=False):
+        token = st.secrets.get("DROPBOX_ACCESS_TOKEN", None)
+        folder = st.text_input("Dropbox folder path (starts with /)", value="/ResidualComparison/inbox")
+        overwrite = st.checkbox("Overwrite existing files", value=True)
+        info = st.markdown(
+            "Set your `DROPBOX_ACCESS_TOKEN` in **Advanced settings → Secrets** when deploying on Streamlit Cloud. "
+            "Use a path like `/ResidualComparison/inbox` for the app's namespace.", help="Requires a Dropbox app token"
+        )
+        if not token:
+            st.info("No Dropbox token found. Add `DROPBOX_ACCESS_TOKEN` via Streamlit Cloud Secrets.", icon="⚠️")
+        else:
+            dbx = dropbox.Dropbox(token)
+            if st.button("Upload ORIGINAL files to Dropbox"):
+                try:
+                    # Use uploaded names; default to sensible names if missing
+                    name_last = last_upl.name or "last_month.xlsx"
+                    name_this = this_upl.name or "this_month.xlsx"
+                    dest_last = f"{folder.rstrip('/')}/{name_last}"
+                    dest_this = f"{folder.rstrip('/')}/{name_this}"
+                    upload_bytes_to_dropbox(dbx, last_bytes, dest_last, overwrite=overwrite)
+                    upload_bytes_to_dropbox(dbx, this_bytes, dest_this, overwrite=overwrite)
+                    st.success(f"Uploaded: {dest_last} and {dest_this}")
+                except Exception as e:
+                    st.error(f"Dropbox upload failed: {e}")
+
+            if st.button("Upload GENERATED workbooks to Dropbox"):
+                try:
+                    dest_full = f"{folder.rstrip('/')}/{out_name_full}"
+                    dest_filtered = f"{folder.rstrip('/')}/{out_name_filtered}"
+                    upload_bytes_to_dropbox(dbx, full_bio.getvalue(), dest_full, overwrite=overwrite)
+                    upload_bytes_to_dropbox(dbx, filtered_bio.getvalue(), dest_filtered, overwrite=overwrite)
+                    st.success(f"Uploaded: {dest_full} and {dest_filtered}")
+                except Exception as e:
+                    st.error(f"Dropbox upload failed: {e}")
 
 # --- EOF ---
