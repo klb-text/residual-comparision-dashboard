@@ -54,8 +54,13 @@ def parse_list(val):
     return tuple(uniq)
 
 @st.cache_data
-def load_sheet(file_bytes):
-    df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=0, engine='openpyxl')
+def load_sheet(_file_bytes: bytes):
+    """
+    Load the first sheet from an uploaded Excel file.
+    NOTE: Leading underscore in '_file_bytes' tells Streamlit not to hash this arg for caching.
+    Pass raw bytes from UploadedFile.read().
+    """
+    df = pd.read_excel(io.BytesIO(_file_bytes), sheet_name=0, engine='openpyxl')
     df.columns = [str(c).strip() for c in df.columns]
     # Minimal check
     missing = [c for c in REQ_COLUMNS if c not in df.columns]
@@ -172,8 +177,9 @@ if run_btn:
         st.error("Please upload both files before running the comparison.")
         st.stop()
     try:
-        last_df = load_sheet(last_upl.getbuffer())
-        this_df = load_sheet(this_upl.getbuffer())
+        # Use .read() to get bytes; pass to loader with underscore arg (excluded from caching)
+        last_df = load_sheet(last_upl.read())
+        this_df = load_sheet(this_upl.read())
     except Exception as e:
         st.error(f"Failed to read files: {e}")
         st.stop()
