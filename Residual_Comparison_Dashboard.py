@@ -2,9 +2,11 @@
 # Residual Comparison Dashboard (Streamlit)
 # Upload two Excel files (last month & this month), filter to "Changed" by default,
 # show "What Changed", download workbooks, and push files to Dropbox.
+# Fix: cache loader per-file by hashing file bytes; add "Clear cache & rerun".
 # Author: M365 Copilot for Kevin Blamer
 
 import io
+import hashlib
 import pandas as pd
 import numpy as np
 import streamlit as st
@@ -22,10 +24,14 @@ st.caption(
     "Residual Master Title: Terms & Optional Miles, plus Normal Miles changes."
 )
 
+# --- Top utility: clear cache & rerun ---
+with st.sidebar:
+    if st.button("🔄 Clear cache & rerun"):
+        st.cache_data.clear()
+        st.rerun()
+
 # --- Helpers ---
-REQ_COLUMNS = [
-    "Residual Master Title", "Normal Miles", "Optional Miles", "Terms"
-]
+REQ_COLUMNS = ["Residual Master Title", "Normal Miles", "Optional Miles", "Terms"]
 OPTIONAL_COLUMNS = ["Finance Company"]  # used if present
 
 @st.cache_data
@@ -59,12 +65,13 @@ def parse_list(val):
             uniq.append(v)
     return tuple(uniq)
 
-@st.cache_data
-def load_sheet(_file_bytes: bytes):
+@st.cache_data(show_spinner=True)
+def load_sheet(_file_bytes: bytes, file_key: str):
     """
     Load the first sheet from an uploaded Excel file.
-    Leading underscore in '_file_bytes' excludes it from cache hashing.
-    Pass raw bytes from UploadedFile.read().
+    NOTE:
+      • Leading underscore excludes raw bytes from caching hash (per Streamlit docs).
+      • 'file_key' IS hashed, so a different file produces a different cache entry.
     """
     df = pd.read_excel(io.BytesIO(_file_bytes), sheet_name=0, engine='openpyxl')
     df.columns = [str(c).strip() for c in df.columns]
@@ -79,10 +86,9 @@ def safe_get(series, key, default=""):
     except Exception:
         return default
 
-@st.cache_data
+@st.cache_data(show_spinner=True)
 def compare_frames(last_df: pd.DataFrame, this_df: pd.DataFrame):
     """Return (summary_df, result_df, changes_df) comparing last vs this month by Residual Master Title."""
-
     # Build keyed dicts by Residual Master Title
     last_keyed = {}
     for _, row in last_df.iterrows():
@@ -173,7 +179,7 @@ def compare_frames(last_df: pd.DataFrame, this_df: pd.DataFrame):
             'Residual Master Title': title,
             'Finance Company': finance_company,
             'Status': status,
-            'What Changed': what_changed,  # NEW COLUMN after Status
+            'What Changed': what_changed,
             'Normal Miles (prev)': normal_prev,
             'Normal Miles (curr)': normal_curr,
             'Normal Miles Changed': (normal_prev != normal_curr),
@@ -197,7 +203,6 @@ def compare_frames(last_df: pd.DataFrame, this_df: pd.DataFrame):
         'Removed': int((result_df['Status'].str.startswith('Removed')).sum()),
     }
     summary_df = pd.DataFrame(list(summary.items()), columns=['Metric','Value'])
-
     changes_df = result_df[result_df['Status'] == 'Changed'].copy()
 
     ordered_cols = [
@@ -214,17 +219,13 @@ def compare_frames(last_df: pd.DataFrame, this_df: pd.DataFrame):
 
 # --- Dropbox helpers ---
 def upload_bytes_to_dropbox(dbx: dropbox.Dropbox, data: bytes, dest_path: str, overwrite: bool = True):
-    """
-    Upload bytes to Dropbox at dest_path.
-    Uses chunked upload for large payloads and WriteMode.overwrite by default.
-    """
+    """Upload bytes to Dropbox (chunked for >4MB), default overwrite mode."""
     mode = WriteMode.overwrite if overwrite else WriteMode.add
     CHUNK = 4 * 1024 * 1024  # 4MB
     size = len(data)
     if size <= CHUNK:
         dbx.files_upload(data, dest_path, mode=mode)
         return
-    # Chunked upload
     start = dbx.files_upload_session_start(data[:CHUNK])
     cursor = UploadSessionCursor(session_id=start.session_id, offset=CHUNK)
     while cursor.offset < size:
@@ -237,7 +238,7 @@ def upload_bytes_to_dropbox(dbx: dropbox.Dropbox, data: bytes, dest_path: str, o
             dbx.files_upload_session_append_v2(chunk, cursor)
             cursor.offset = next_offset
 
-# --- UI ---
+# --- UI: Uploads ---
 col_l, col_r = st.columns(2)
 with col_l:
     last_upl = st.file_uploader("Upload LAST month Basic_Information workbook", type=["xlsx"], key="last")
@@ -250,12 +251,17 @@ if run_btn:
     if not last_upl or not this_upl:
         st.error("Please upload both files before running the comparison.")
         st.stop()
+
     try:
-        # Read once so we retain raw bytes for Dropbox and parsing
+        # Read bytes once and compute digest keys so the cache differentiates different files
         last_bytes = last_upl.read()
         this_bytes = this_upl.read()
-        last_df = load_sheet(last_bytes)
-        this_df = load_sheet(this_bytes)
+
+        last_key = hashlib.sha256(last_bytes).hexdigest()
+        this_key = hashlib.sha256(this_bytes).hexdigest()
+
+        last_df = load_sheet(last_bytes, last_key)
+        this_df = load_sheet(this_bytes, this_key)
     except Exception as e:
         st.error(f"Failed to read files: {e}")
         st.stop()
@@ -336,9 +342,9 @@ if run_btn:
         token = st.secrets.get("DROPBOX_ACCESS_TOKEN", None)
         folder = st.text_input("Dropbox folder path (starts with /)", value="/ResidualComparison/inbox")
         overwrite = st.checkbox("Overwrite existing files", value=True)
-        info = st.markdown(
-            "Set your `DROPBOX_ACCESS_TOKEN` in **Advanced settings → Secrets** when deploying on Streamlit Cloud. "
-            "Use a path like `/ResidualComparison/inbox` for the app's namespace.", help="Requires a Dropbox app token"
+        st.markdown(
+            "Set your `DROPBOX_ACCESS_TOKEN` in **Advanced settings → Secrets** when deploying on Streamlit Cloud.",
+            help="Configure secrets safely in Cloud; never commit tokens to Git."
         )
         if not token:
             st.info("No Dropbox token found. Add `DROPBOX_ACCESS_TOKEN` via Streamlit Cloud Secrets.", icon="⚠️")
@@ -346,7 +352,6 @@ if run_btn:
             dbx = dropbox.Dropbox(token)
             if st.button("Upload ORIGINAL files to Dropbox"):
                 try:
-                    # Use uploaded names; default to sensible names if missing
                     name_last = last_upl.name or "last_month.xlsx"
                     name_this = this_upl.name or "this_month.xlsx"
                     dest_last = f"{folder.rstrip('/')}/{name_last}"
